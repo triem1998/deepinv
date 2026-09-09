@@ -35,7 +35,7 @@ from deepinv.models.drunet import DRUNet
 from deepinv.optim import L2, L1, PGD
 from deepinv.optim.data_fidelity import StackedPhysicsDataFidelity
 from deepinv.optim.prior import PnP
-from deepinv.loss.metric import PSNR, Metric
+from deepinv.loss.metric import PSNR
 from deepinv.distributed.framework import (
     DistributedContext,
     DistributedStackedLinearPhysics,
@@ -3304,20 +3304,20 @@ def test_sharded_physics_heterogeneous_measurement_shapes():
 def _test_sync_metrics_worker(rank, world_size, args):
     """Score a replica-specific batch and report gathered and local values."""
     x = torch.zeros(2, 1, 4, 4)
-    metric = PSNR()
 
     with DistributedContext(
         device_mode="cpu", inner_world_size=args["inner_world_size"]
     ) as ctx:
         x_net = torch.full_like(x, 0.1 * (ctx.dp_rank + 1))
+        local_metric = PSNR()
+        global_metric = ctx.sync_metric(PSNR())
         with torch.no_grad():
-            gathered = metric(x_net=x_net, x=x)
+            local = local_metric(x_net=x_net, x=x)
+            gathered = global_metric(x_net=x_net, x=x)
         # Scores computed where they may feed a backward pass stay local.
         with torch.enable_grad():
-            in_graph = metric(x_net=x_net, x=x)
+            in_graph = global_metric(x_net=x_net, x=x)
 
-    assert "__call__" not in Metric.__dict__
-    local = metric(x_net=x_net, x=x)
     return {
         "gathered": [round(float(v), 4) for v in gathered],
         "in_graph": list(in_graph.shape),
@@ -3327,8 +3327,6 @@ def _test_sync_metrics_worker(rank, world_size, args):
 
 def test_sync_metrics():
     """Metric scores are gathered over data-parallel replicas."""
-    if platform.system() == "Windows":
-        pytest.skip("Gloo multi-process tests are not supported on Windows")
     config = {"device_mode": "cpu", "world_size": 2, "skip_reason": None}
     results = run_distributed_test(
         _test_sync_metrics_worker,
@@ -3344,8 +3342,6 @@ def test_sync_metrics():
 
 def test_sync_metrics_hierarchical():
     """Inner ranks score the same samples, so the gather stays data-parallel."""
-    if platform.system() == "Windows":
-        pytest.skip("Gloo multi-process tests are not supported on Windows")
     config = {"device_mode": "cpu", "world_size": 4, "skip_reason": None}
     results = run_distributed_test(
         _test_sync_metrics_worker,
