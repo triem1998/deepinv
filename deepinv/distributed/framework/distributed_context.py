@@ -11,6 +11,9 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 
+from deepinv.loss.metric import Metric
+from deepinv.distributed.framework.distributed_utils import gather_metric_scores
+
 
 def _reject_ddp_higher_order_gradient(grad):
     """Reject DDP reduction before it mutates a differentiable gradient."""
@@ -88,6 +91,9 @@ class DistributedContext:
         keeps gradient scale independent of the process count and is the
         default. The selected operation has the same meaning for first- and
         higher-order gradients.
+    :param bool sync_metrics: gather per-sample metric scores across data-parallel
+        replicas, so metrics average over the whole dataset. Every rank must then
+        call metrics the same number of times. Default is ``True``.
     """
 
     def __init__(
@@ -100,6 +106,7 @@ class DistributedContext:
         device_mode: str | None = None,
         inner_world_size: int | None = None,
         gradient_reduction: Literal["mean", "sum"] = "mean",
+        sync_metrics: bool = True,
     ):
         if inner_world_size is not None and (
             isinstance(inner_world_size, bool)
@@ -118,6 +125,7 @@ class DistributedContext:
         self.device_mode = device_mode
         self._requested_inner_world_size = inner_world_size
         self.gradient_reduction = gradient_reduction
+        self.sync_metrics = sync_metrics
 
         self.created_dist = False
         self.use_dist = False
@@ -142,6 +150,8 @@ class DistributedContext:
         self._param_sync_scheduled_tasks: set[int] = set()
         self._param_sync_pending: dict[int, dict[int, torch.nn.Parameter]] = {}
         self._ddp_managed_parameter_ids: set[int] = set()
+        self._metric_call: Callable | None = None
+        self._metric_patched = False
 
     def __enter__(self):
         # Detect whether we should initialize a process group
@@ -221,9 +231,18 @@ class DistributedContext:
                 self.created_dist = False
             raise
         self._post_init_setup()
+        if self.sync_metrics and self.dp_world_size > 1:
+            self._patch_metric_call()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if self._metric_patched:
+            if self._metric_call is None:
+                del Metric.__call__
+            else:
+                Metric.__call__ = self._metric_call
+            self._metric_patched = False
+
         # Only destroy process group if:
         # 1. cleanup=True (caller wants cleanup)
         # 2. We initialized it (created_dist=True)
@@ -234,6 +253,23 @@ class DistributedContext:
             except Exception:
                 pass
             dist.destroy_process_group()
+
+    def _patch_metric_call(self):
+        r"""Gather metric scores across replicas while the context is active."""
+        original = Metric.__call__
+
+        def call(metric, *args, **kwargs):
+            return gather_metric_scores(self, original(metric, *args, **kwargs))
+
+        self._metric_call = Metric.__dict__.get("__call__")
+        self._metric_patched = True
+        Metric.__call__ = call
+        if self.is_global_main:
+            warnings.warn(
+                "Metric scores are gathered across data-parallel replicas; every "
+                "rank must call metrics the same number of times. Disable with "
+                "sync_metrics=False."
+            )
 
     def _create_topology(self):
         """Create row (inner) and column (data-parallel) process groups."""

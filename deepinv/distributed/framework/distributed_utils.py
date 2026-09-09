@@ -417,6 +417,15 @@ class DistributedReplicatedParameters:
         self._hooks.clear()
 
 
+def gather_metric_scores(ctx: DistributedContext, output: torch.Tensor) -> torch.Tensor:
+    r"""Gather per-sample metric scores over data-parallel replicas."""
+    if not ctx.use_dist or ctx.dp_world_size == 1 or torch.is_grad_enabled():
+        return output
+    scores = [None] * ctx.dp_world_size
+    ctx.all_gather_object(scores, output.detach().reshape(-1).cpu(), group=ctx.dp_group)
+    return torch.cat(scores).to(output.device)
+
+
 def gather_tensorlist_naive(
     ctx: DistributedContext,
     local_indices: list[int],
