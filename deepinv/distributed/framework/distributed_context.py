@@ -11,6 +11,9 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 
+from deepinv.loss.metric import Metric
+from deepinv.distributed.framework.distributed_utils import gather_metric_scores
+
 
 def _reject_ddp_higher_order_gradient(grad):
     """Reject DDP reduction before it mutates a differentiable gradient."""
@@ -355,6 +358,20 @@ class DistributedContext:
             seed=0 if sampler_seed is None else sampler_seed,
             drop_last=drop_last,
         )
+
+    def sync_metric(self, metric: Metric) -> Metric:
+        r"""Gather per-sample metric scores across data-parallel replicas.
+
+        Scores computed where they may feed a backward pass are left local.
+        All ranks must call the metric the same number of times.
+
+        :param deepinv.loss.metric.Metric metric: metric, modified in place.
+        :return: the same metric, scoring the whole dataset.
+        """
+        metric.register_forward_hook(
+            lambda module, args, output: gather_metric_scores(self, output)
+        )
+        return metric
 
     def distributed_data_parallel(
         self, module: torch.nn.Module, **kwargs
