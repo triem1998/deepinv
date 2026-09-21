@@ -242,7 +242,7 @@ class DistributedProcessing(torch.nn.Module):
             if self.checkpoint_batches == "always":
                 use_batch_checkpointing = True
             elif self.checkpoint_batches == "auto":
-                use_batch_checkpointing = len(batched_patches) > 1
+                use_batch_checkpointing = 0 < (self.max_batch_size or 0) < len(patches)
 
         # 3. Apply processor to each batch
         processed_batches = []

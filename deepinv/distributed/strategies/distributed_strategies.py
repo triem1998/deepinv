@@ -11,7 +11,7 @@ from __future__ import annotations
 import warnings
 
 from abc import ABC, abstractmethod
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import torch
 
@@ -83,7 +83,7 @@ class DistributedSignalStrategy(ABC):
 
     def apply_batching(
         self, patches: list[torch.Tensor], max_batch_size: int | None = None
-    ) -> list[torch.Tensor]:
+    ) -> Iterator[torch.Tensor]:
         r"""
         Group patches into batches for efficient processing.
 
@@ -93,10 +93,10 @@ class DistributedSignalStrategy(ABC):
 
         :param list[torch.Tensor] patches: list of prepared patches.
         :param int | None max_batch_size: maximum number of patches per batch. If `None`, all patches are batched together. If `1`, each patch is processed individually.
-        :return: batched patches ready for processing. When processed results are concatenated, they should preserve the original patch order.
+        :return: batched patches ready for processing, yielded one at a time so that only one batch copy is alive. When processed results are concatenated, they should preserve the original patch order.
         """
         if not patches:
-            return []
+            return
 
         # Verify all patches have the same shape
         expected_shape = patches[0].shape
@@ -120,17 +120,12 @@ class DistributedSignalStrategy(ABC):
             or max_batch_size <= 0
         ):
             # Concatenate all patches along batch dimension
-            batch = torch.cat(patches, dim=0)
-            return [batch]
+            yield torch.cat(patches, dim=0)
+            return
 
         # Otherwise, split into multiple batches
-        batches = []
         for i in range(0, len(patches), max_batch_size):
-            batch_patches = patches[i : i + max_batch_size]
-            batch = torch.cat(batch_patches, dim=0)
-            batches.append(batch)
-
-        return batches
+            yield torch.cat(patches[i : i + max_batch_size], dim=0)
 
     def unpack_batched_results(
         self, processed_batches: list[torch.Tensor], num_patches: int
@@ -138,7 +133,7 @@ class DistributedSignalStrategy(ABC):
         r"""
         Unpack processed batches back to individual patches.
 
-        Default implementation: concatenate along batch dimension and split back.
+        Default implementation: split each batch back into patches (views, no copy).
         Uses stored metadata to determine original patch batch size.
 
         :param list[torch.Tensor] processed_batches: results from processing batched patches.
@@ -153,16 +148,9 @@ class DistributedSignalStrategy(ABC):
         if hasattr(self, "_batching_metadata"):
             original_batch_size = self._batching_metadata.get("original_batch_size", 1)
 
-        # Concatenate all batches
-        if len(processed_batches) == 1:
-            all_batched = processed_batches[0]
-        else:
-            all_batched = torch.cat(processed_batches, dim=0)
-
-        # Split back into individual patches
+        # Split each batch back into individual patches
         # Each patch has original_batch_size elements in the batch dimension
-        patches = []
-        total_batch_size = all_batched.shape[0]
+        total_batch_size = sum(batch.shape[0] for batch in processed_batches)
         expected_total = num_patches * original_batch_size
 
         if total_batch_size != expected_total:
@@ -171,13 +159,11 @@ class DistributedSignalStrategy(ABC):
                 f"expected {num_patches} patches × {original_batch_size} batch size = {expected_total}"
             )
 
-        for i in range(num_patches):
-            start = i * original_batch_size
-            end = (i + 1) * original_batch_size
-            patch = all_batched[start:end]
-            patches.append(patch)
-
-        return patches
+        return [
+            patch
+            for batch in processed_batches
+            for patch in batch.split(original_batch_size, dim=0)
+        ]
 
 
 class TilingStrategy(DistributedSignalStrategy):
