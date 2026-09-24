@@ -494,6 +494,10 @@ class AutoTuner:
                     peak_inf = torch.cuda.max_memory_allocated(self.device) - base
                     held = peak_train = t_bwd = 0
                     if self.train:
+                        # warm-up: the backward kernels are chosen on the first call
+                        y = self.denoiser(x, *args, **kwargs)
+                        (y**2).mean().backward()
+                        del y
                         torch.cuda.reset_peak_memory_stats(self.device)
                         y = self.denoiser(x, *args, **kwargs)
                         held = torch.cuda.memory_allocated(self.device) - base
