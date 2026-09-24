@@ -6,6 +6,7 @@ import gc
 import math
 import os
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
@@ -14,7 +15,9 @@ import torch
 
 from deepinv.models.base import Denoiser
 from deepinv.distributed.framework import DistributedContext, DistributedStackedPhysics
+from deepinv.distributed.framework import distributed_data_fidelity, distributed_physics
 from deepinv.distributed.strategies.utils import tiling_splitting_strategy
+from deepinv.utils.tensorlist import TensorList
 
 
 @dataclass
@@ -141,8 +144,8 @@ class AutoTuner:
     :param Callable step: `step(model, physics)`: one step on one image, with backward and
         `optimizer.step()` in training. It can wrap a :class:`deepinv.Trainer`, e.g.
         `trainer.compute_loss(physics, x, y, train=True, step=True)`, so that the probe measures the
-        code the job runs. It takes its measurements from the data: the probe plays one rank alone,
-        so a gather over the group would return holes.
+        code the job runs. The probe plays one rank alone: a gather returns zeros for the other
+        ranks' operators, which count their memory but not their values.
     :param int overlap: tile overlap.
     :param torch.optim.Optimizer optimizer: training optimizer, to count its state. `None` for inference.
     :param float gpu_memory_gb: target GPU memory. Default: the probe GPU.
@@ -183,6 +186,7 @@ class AutoTuner:
             raise ValueError("model must be or contain a deepinv.models.Denoiser")
         self._runs: dict[int, _Run | None] = {}
         self.tiles: list[_Tile] | None = None
+        self._shapes: dict[int, torch.Size] = {}  # measurement shape of each operator
 
     def min_gpus(self, max_gpus: int) -> tuple[int | None, int | None]:
         r"""
@@ -328,6 +332,9 @@ class AutoTuner:
         if exact and size not in self._runs:
             if not self._runs:
                 self._setup()
+                # P=1 sees every operator: it gives the measurement shapes
+                if size != 1:
+                    self._runs[1] = self._probe_phys(1)
             self._runs[size] = self._probe_phys(size)
             if self.tiles is None and self._runs[size]:
                 self.tiles = self._probe_tiles()
@@ -433,7 +440,11 @@ class AutoTuner:
         # not entered: no process group, collectives return their input
         ctx = DistributedContext()
         ctx.inner_world_size, ctx.inner_rank, ctx.device = inner, 0, self.device
-        with _restored(self.model, self.optimizer), _no_shard_check():
+        with (
+            _restored(self.model, self.optimizer),
+            _no_shard_check(),
+            _filled_gather(self._shapes, self.train),
+        ):
             torch.cuda.reset_peak_memory_stats(self.device)
             self.denoiser.forward = identity  # on the instance: every reference sees it
             gc.disable()  # reference cycles would be freed at random moments
@@ -612,6 +623,46 @@ def _no_shard_check():
         yield
     finally:
         DistributedStackedPhysics._validate_shard_ownership = check
+
+
+@contextmanager
+def _filled_gather(shapes: dict[int, torch.Size], train: bool):
+    """
+    Fill the holes of a gather with zeros, as if the other ranks had answered.
+
+    :param dict shapes: measurement shape of each operator, updated at each gather.
+    :param bool train: whether the zeros require gradients.
+    """
+    original = distributed_physics.map_reduce_gather
+
+    def gather(*args, **kwargs):
+        out = original(*args, **kwargs)
+        if not isinstance(out, TensorList):
+            return out  # a reduction
+        shapes.update({i: r.shape for i, r in enumerate(out.x) if r is not None})
+        ref = next((r for r in out.x if r is not None), None)
+        for i, r in enumerate(out.x):
+            if r is None and ref is not None:
+                if i not in shapes:
+                    warnings.warn(
+                        f"shape of operator {i} unknown, taken from a local one"
+                    )
+                out.x[i] = torch.zeros(
+                    shapes.get(i, ref.shape),
+                    dtype=ref.dtype,
+                    device=ref.device,
+                    requires_grad=train,
+                )
+        return out
+
+    modules = (distributed_physics, distributed_data_fidelity)
+    for m in modules:
+        m.map_reduce_gather = gather
+    try:
+        yield
+    finally:
+        for m in modules:
+            m.map_reduce_gather = original
 
 
 @contextmanager
