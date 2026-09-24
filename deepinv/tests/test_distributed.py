@@ -26,16 +26,24 @@ import platform
 import torch.multiprocessing as mp
 from typing import Callable, Any
 
-from deepinv.physics import Blur, GaussianNoise
+from deepinv.physics import Blur, Denoising, GaussianNoise
 from deepinv.physics.functional import gaussian_blur
 from deepinv.physics.forward import StackedLinearPhysics
 from deepinv.utils.tensorlist import TensorList
 from deepinv.models.base import Denoiser
 from deepinv.models.drunet import DRUNet
+from deepinv.models.median import MedianFilter
 from deepinv.optim import L2, L1, PGD
 from deepinv.optim.data_fidelity import StackedPhysicsDataFidelity
 from deepinv.optim.prior import PnP
 from deepinv.loss.metric import PSNR
+from deepinv.distributed.autotune import (
+    AutoTuner,
+    _no_shard_check,
+    _patch_candidates,
+    _Run,
+    _Tile,
+)
 from deepinv.distributed.framework import (
     DistributedContext,
     DistributedStackedLinearPhysics,
@@ -3352,3 +3360,143 @@ def test_sync_metrics_hierarchical():
 
     expected = results[0]["local"] + results[2]["local"]
     assert all(result["gathered"] == expected for result in results)
+
+
+# =============================================================================
+# AutoTuner Tests (fake probes, except the last one which needs a GPU)
+# =============================================================================
+
+
+def fake_autotuner(g=0, budget=110, tiles=None, m_phys=400.0, train=True):
+    """Tuner with fake probes, by default: 64 tiles, physics fitting for P >= 4. No GPU."""
+    opt = None
+    if train:
+        opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1.0)
+    tuner = AutoTuner(MedianFilter(), None, None, overlap=8, optimizer=opt)
+    tuner.budget, tuner.extra, tuner.g, tuner.v = budget, 0, g, 0
+    tuner._setup = lambda: None
+    tuner._probe_phys = lambda P: _Run(m_phys / P, 0, 1, 0.0)
+    tuner._probe_tiles = lambda: tiles or [
+        _Tile((256, 256), (-2, -1), 64, 0, 0, 0, 10, 10, 1.0, 0.0)
+    ]
+    return tuner
+
+
+# (patch, dims, tiles, vpad, win, peak_inf, held, peak_train, t_fwd, t_bwd)
+BIG_TILE = _Tile((256, 256), (-2, -1), 8, 0, 1, 4, 3, 5, 1.0, 1.0)
+SMALL_TILE = _Tile((128, 128), (-2, -1), 16, 0, 1, 4, 3, 5, 0.6, 0.6)
+
+
+def test_autotune_probes_a_sharded_physics():
+    """A probe plays one rank of a group alone, so the others cannot answer the ownership check."""
+    ctx = DistributedContext()
+    ctx.inner_world_size, ctx.inner_rank, ctx.device = 2, 0, torch.device("cpu")
+    build = lambda: distribute(
+        [Denoising(GaussianNoise(0.1))],
+        ctx,
+        type_object="physics",
+        from_shard=True,
+        num_operators=2,
+        global_indices=[0],
+    )
+    with _no_shard_check():
+        assert build().local_indexes == [0]
+    with pytest.raises(TypeError):  # the check is back, and it needs the other rank
+        build()
+
+
+def test_autotune_first_fit():
+    tested = []
+    ok = lambda P: tested.append(P) or P >= 5
+    assert AutoTuner._first_fit(ok, 64) == 5
+    assert tested == [1, 2, 4, 8, 6, 5]
+    assert AutoTuner._first_fit(lambda P: False, 10) is None
+
+
+def test_autotune_min_gpus_and_best_multi():
+    tuner = fake_autotuner()
+    assert tuner.min_gpus(64) == (4, 6)
+    # 22 GPUs: (5 groups, P=4, always), (3, 7, never), (2, 11, never) -> 2 x 11 wins
+    cfg = tuner.best_multi(22)
+    assert (cfg.samples_per_step, cfg.inner_world_size) == (2, 11)
+    assert cfg.checkpoint_batches == "never" and cfg.gpus_used == 22
+    assert [c.inner_world_size for c in cfg.alternatives] == [7, 4]
+
+
+def test_autotune_ddp_moves_p_min():
+    # the DDP copy of the gradients leaves 80 for the physics: 400 / P <= 80 -> P >= 5
+    tuner = fake_autotuner(g=30)
+    fits = lambda P: tuner._best(P, ("always",), ddp=True) is not None
+    assert AutoTuner._first_fit(fits, 64) == 5
+
+
+def test_autotune_patch_candidates():
+    # square image: both axes cut evenly, window (patch + 2 * 32) a multiple of 16, tiles >= 64
+    patches = [p for p, _ in _patch_candidates((1500, 1500), 32)]
+    assert [p[0] for p in patches] == [752, 512, 384, 256, 192, 128, 96]
+    assert all(p[0] == p[1] and (p[0] + 64) % 16 == 0 for p in patches)
+    # long image: the short axis is kept whole until tiles are smaller than it
+    cands = _patch_candidates((4096, 512), 32)
+    assert cands[0] == ((2048,), (-2,))
+    assert cands[5] == ((352, 256), (-2, -1))
+    # user sizes: cut every axis longer than the patch, largest first
+    assert _patch_candidates((256, 128, 256), 8, [64, 128]) == [
+        ((128, 128), (-3, -1)),
+        ((64, 64, 64), (-3, -2, -1)),
+    ]
+
+
+def test_autotune_best_single():
+    # P = 2: 4 big tiles per GPU, m0 = 2 k win + k (held - win) = 16, per_tile = 2 -> mb = 4 = k
+    tuner = fake_autotuner(budget=40, tiles=[BIG_TILE, SMALL_TILE], m_phys=0.0)
+    cfg = tuner.best_single(2)
+    assert (cfg.patch_size, cfg.checkpoint_batches) == ((256, 256), "never")
+    assert cfg.max_batch_size == 4 and cfg.peak_mb == 24 / 2**20 and cfg.step_s == 8.0
+    # 8 small tiles per GPU: m0 = 32 leaves room for 4 of them only
+    small = next(c for c in cfg.alternatives if c.patch_size == (128, 128))
+    assert small.max_batch_size == 4
+    # the other patch size and both "always" configs, slowest last
+    assert [c.step_s for c in cfg.alternatives] == pytest.approx([9.6, 12.0, 14.4])
+    assert cfg.tiling_kwargs() == dict(
+        patch_size=(256, 256),
+        overlap=8,
+        max_batch_size=4,
+        checkpoint_batches="never",
+        tiling_dims=(-2, -1),
+    )
+
+
+def test_autotune_inference():
+    # no optimizer: no checkpointing, m0 = 2 k win = 8 and per_tile = peak_inf - win = 3
+    # patch, dims, tiles, vpad, win, peak_inf, then zeros: no backward is measured
+    tile = _Tile((256, 256), (-2, -1), 8, 0, 1, 4, 0, 0, 1.0, 0.0)
+    tuner = fake_autotuner(budget=40, tiles=[tile], m_phys=0.0, train=False)
+    assert tuner.modes == ("never",)
+    cfg = tuner.best_single(2)
+    assert cfg.max_batch_size == 4 and cfg.peak_mb == 20 / 2**20
+    assert cfg.step_s == 4.0 and cfg.alternatives == []
+
+
+def test_autotune_nothing_fits():
+    tuner = fake_autotuner(budget=1)
+    assert tuner.min_gpus(8) == (None, None)
+    assert tuner.best_single(8) is None and tuner.best_multi(8) is None
+    with pytest.raises(ValueError):
+        AutoTuner(torch.nn.Linear(1, 1), None, None, overlap=8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="autotuner probes need a GPU")
+def test_autotune_probes_gpu():
+    """The probes run for real: one step with an identity denoiser, then one window per patch size."""
+    device = "cuda"
+    model = DRUNet(pretrained=None, device=device)
+    y = torch.randn(1, 3, 256, 256, device=device)
+    step = lambda model, physics: model(physics.A_adjoint(y), 0.05)
+    physics = Denoising(GaussianNoise(0.05))
+    tuner = AutoTuner(model, lambda ctx: physics, step, overlap=16)
+    cfg = tuner.best_single(2)
+    assert cfg is not None
+    assert all(0 < p < 256 for p in cfg.patch_size)
+    assert 0 < cfg.peak_mb < tuner.budget / 2**20
+    assert cfg.max_batch_size >= 1 and cfg.step_s > 0
+    assert tuner.tiles and all(t.peak_inf > t.win for t in tuner.tiles)

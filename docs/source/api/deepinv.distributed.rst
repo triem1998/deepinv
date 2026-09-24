@@ -19,6 +19,8 @@ These are the main components most users need:
    :nosignatures:
 
    deepinv.distributed.DistributedContext
+   deepinv.distributed.AutoTuner
+   deepinv.distributed.TilingConfig
 
 .. autosummary::
    :toctree: stubs

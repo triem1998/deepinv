@@ -386,6 +386,41 @@ Set ``max_batch_size=1`` to process local patches sequentially when memory is
 tight. This is slower, but often allows training on larger images or volumes.
 
 
+Choosing the Tiling
+-------------------
+
+:class:`deepinv.distributed.AutoTuner` picks ``inner_world_size``, ``patch_size``,
+``max_batch_size`` and ``checkpoint_batches`` from quick probes on one GPU: one step with
+the denoiser replaced by an identity per tested ``inner_world_size``, and one window
+per patch size. No training and no multi-GPU run.
+
+.. code-block:: python
+
+    make_physics = lambda ctx: distribute(factory, ctx, num_operators=ctx.inner_world_size)
+
+    def step(model, physics):
+        loss = mse(model(physics(x), physics), x)
+        loss.backward(); optimizer.step(); optimizer.zero_grad()
+
+    tuner = AutoTuner(model, make_physics, step, overlap=32, optimizer=optimizer, gpu_memory_gb=32)
+    tuner.min_gpus(max_gpus=64)       # smallest group size, with "always" and with "never"
+    tuner.best_single(num_gpus=8)     # one image on 8 GPUs
+    cfg = tuner.best_multi(num_gpus=22)  # groups x GPUs per group, for the most images/s
+
+    ctx = DistributedContext(inner_world_size=cfg.inner_world_size)
+    model = distribute(model, ctx, **cfg.tiling_kwargs())
+
+Probe on the same GPU type and software as the target, and use the same
+``PYTORCH_CUDA_ALLOC_CONF`` in the probe and the job: the default ``memory_fraction`` depends on it.
+
+.. note::
+
+    See :ref:`sphx_glr_auto_examples_distributed_demo_autotune.py` for a complete example.
+
+Pass ``physics_scales=False`` when every rank builds the full operator (``num_operators=None``) or
+when the measurements are replicated: the physics is then probed once instead of once per group size.
+
+
 Running Multi-Process
 ---------------------
 
