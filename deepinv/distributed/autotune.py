@@ -522,7 +522,8 @@ class AutoTuner:
                 )
             except torch.OutOfMemoryError:
                 pass
-            x = None
+            # y survives an out of memory in the backward: its graph must not reach the next probe
+            x = y = None
         if not tiles:
             raise RuntimeError("no patch size fits on the probe GPU")
         return tiles
