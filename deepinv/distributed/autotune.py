@@ -6,7 +6,6 @@ import gc
 import math
 import os
 import time
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
@@ -154,6 +153,9 @@ class AutoTuner:
         Default: 0.9 with `expandable_segments`, else 0.8.
     :param bool physics_scales: whether the physics is split over the GPUs of a group, so that its
         memory and time depend on the group size. `False` probes it once and reuses that run.
+    :param tuple[int, ...] measurement_shape: shape of the whole measurement `y`, batch included.
+        Gives the shape of the other ranks' results without a probe on one GPU. Default: learned
+        from that probe.
     """
 
     def __init__(
@@ -168,6 +170,7 @@ class AutoTuner:
         patch_sizes: list[int] | None = None,
         memory_fraction: float | None = None,
         physics_scales: bool = True,
+        measurement_shape: tuple[int, ...] | None = None,
     ):
         self.model, self.make_physics, self.step = model, make_physics, step
         self.overlap, self.optimizer = overlap, optimizer
@@ -186,7 +189,10 @@ class AutoTuner:
             raise ValueError("model must be or contain a deepinv.models.Denoiser")
         self._runs: dict[int, _Run | None] = {}
         self.tiles: list[_Tile] | None = None
-        self._shapes: dict[int, torch.Size] = {}  # measurement shape of each operator
+        # measurement shape of each (operator count, operator); one operator: the whole measurement
+        self._shapes: dict[tuple[int, int], torch.Size] = {}
+        if measurement_shape is not None:
+            self._shapes[(1, 0)] = torch.Size(measurement_shape)
 
     def min_gpus(self, max_gpus: int) -> tuple[int | None, int | None]:
         r"""
@@ -333,7 +339,7 @@ class AutoTuner:
             if not self._runs:
                 self._setup()
                 # P=1 sees every operator: it gives the measurement shapes
-                if size != 1:
+                if size != 1 and (1, 0) not in self._shapes:
                     self._runs[1] = self._probe_phys(1)
             self._runs[size] = self._probe_phys(size)
             if self.tiles is None and self._runs[size]:
@@ -626,11 +632,12 @@ def _no_shard_check():
 
 
 @contextmanager
-def _filled_gather(shapes: dict[int, torch.Size], train: bool):
+def _filled_gather(shapes: dict[tuple[int, int], torch.Size], train: bool):
     """
     Fill the holes of a gather with zeros, as if the other ranks had answered.
 
-    :param dict shapes: measurement shape of each operator, updated at each gather.
+    :param dict[tuple[int, int], torch.Size] shapes: measurement shape of each
+        `(operator count, operator)`, updated at each gather.
     :param bool train: whether the zeros require gradients.
     """
     original = distributed_physics.map_reduce_gather
@@ -639,20 +646,26 @@ def _filled_gather(shapes: dict[int, torch.Size], train: bool):
         out = original(*args, **kwargs)
         if not isinstance(out, TensorList):
             return out  # a reduction
-        shapes.update({i: r.shape for i, r in enumerate(out.x) if r is not None})
-        ref = next((r for r in out.x if r is not None), None)
-        for i, r in enumerate(out.x):
-            if r is None and ref is not None:
-                if i not in shapes:
-                    warnings.warn(
-                        f"shape of operator {i} unknown, taken from a local one"
-                    )
-                out.x[i] = torch.zeros(
-                    shapes.get(i, ref.shape),
-                    dtype=ref.dtype,
-                    device=ref.device,
-                    requires_grad=train,
-                )
+        n, local = len(out.x), [r for r in out.x if r is not None]
+        holes = [i for i, r in enumerate(out.x) if r is None]
+        shapes.update({(n, i): r.shape for i, r in enumerate(out.x) if r is not None})
+        if not holes or not local:
+            return out
+        shape = list(local[0].shape)
+        whole = shapes.get((1, 0), shape)  # one operator: the whole measurement
+        axes = [d for d, (a, b) in enumerate(zip(whole, shape, strict=True)) if a != b]
+        if len(axes) == 1:  # the operators cut this axis
+            d = axes[0]
+            rest = whole[d] - sum(r.shape[d] for r in local)
+        for k, i in enumerate(holes):
+            if len(axes) == 1:  # the holes share the rest evenly
+                shape[d] = rest // len(holes) + int(k < rest % len(holes))
+            out.x[i] = torch.zeros(
+                shapes.get((n, i), shape),
+                dtype=local[0].dtype,
+                device=local[0].device,
+                requires_grad=train,
+            )
         return out
 
     modules = (distributed_physics, distributed_data_fidelity)
